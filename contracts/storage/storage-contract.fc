@@ -1,0 +1,446 @@
+#include "../imports/stdlib.fc";
+#include "constants.fc";
+
+
+const fee::receipt_value = 20000000;
+const fee::storage = 10000000;
+
+{-
+
+  storage#_ torrent_hash:uint256 active_providers:(HashmapE 256 Provider)
+            owner:MsgAddress file_size:uint64 chunk_size:uint32 debt:Coins
+            merkle_hash:uint256 = Storage;
+
+  provider_info#_ payment_span:uint32 rate_per_mb_day:Coins provider:MsgAddress = ProviderInfo;
+
+  provider#_ next_proof_byte:uint64 last_proof_time:uint32 balance:Coins info:^ProviderInfo = Provider;
+
+-}
+
+(slice, int) begin_parse_special(cell c) asm "x{D739} s,";
+(slice, (slice)) ~load_ref_slice(slice s) asm "LDREFRTOS";
+slice preload_ref_1_slice(slice s) asm "1 PLDREFIDX CTOS";
+
+() check_proof(int merkle_hash, int byte_to_proof, int file_size, int chunk_size, int key_len, cell file_dict_proof) impure {
+    (slice cs, int special) = file_dict_proof.begin_parse_special();
+    throw_if(15, ~ special);
+    throw_if(15, cs~load_uint(8) != 3);
+    throw_if(15, cs.preload_uint(256) != merkle_hash);
+
+    cs = cs~load_ref_slice();
+    int piece = byte_to_proof / chunk_size;
+
+    while (key_len > 0) {
+        if (piece & (1 << (key_len - 1))) {
+            cs = cs.preload_ref_1_slice();
+        } else {
+            cs = cs~load_ref_slice();
+        }
+        key_len -= 1;
+    }
+
+    ;; branch should be 256 bits and no refs
+    throw_unless(15, (cs.slice_bits() == 256) & (cs.slice_refs() == 0));
+}
+
+() recv_internal(int contract_balance, int msg_value, cell in_msg_full, slice in_msg_body) {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    int op = in_msg_body~load_uint(32);
+    if (op == 0) {
+        return ();
+    }
+
+    int query_id = in_msg_body~load_uint(64);
+
+    if(op == op::modify_providers) {
+        var storage = get_data().begin_parse();
+        int torrent_hash = storage~load_uint(256);
+        cell active_providers = storage~load_dict();
+        slice client = storage~load_msg_addr();
+        int file_size = storage~load_uint(64);
+        int chunk_size = storage~load_uint(32);
+        int debt_amount = storage~load_coins();
+        int merkle_hash = storage~load_uint(256);
+        int key_len = storage~load_uint(8);
+
+        if (key_len == 0) {
+            ;; precalc key len
+            while ((chunk_size << key_len) < file_size) {
+                key_len += 1;
+            }
+        }
+
+        throw_unless(error::unauthorized, equal_slices(sender_address, client));
+
+        cell providers = in_msg_body~load_dict();
+
+        ;; terminate not needed providers
+        int continue = -1;
+        int cid = -1;
+        do {
+            (cid, slice active_provider, continue) = active_providers.udict_get_next?(256, cid);
+            if (continue) {
+                ( slice new_provider, int exists) = providers.udict_get?(256, cid);
+                if ((~ exists) | (~ equal_slice_bits(active_provider.preload_ref().begin_parse(), new_provider))) {
+                    active_provider~skip_bits(128);
+                    int balance = active_provider~load_coins();
+
+                    cell ref = active_provider~load_ref();
+                    slice info = ref.begin_parse();
+
+                    info~skip_bits(32);
+                    info~load_coins();
+                    slice addr = info~load_msg_addr();
+
+                    debt_amount -= balance;
+                    if (balance < fee::receipt_value) {
+                        balance = fee::receipt_value;
+                    }
+
+                    var provider_msg = begin_cell()
+                            .store_uint(0x10, 6)
+                            .store_slice(addr)
+                            .store_coins(balance)
+                            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                            .store_uint(op::storage_contract_terminated, 32)
+                            .store_uint(cur_lt(), 64)
+                            .store_uint(torrent_hash, 256)
+                            .end_cell();
+                    send_raw_message(provider_msg, 0);
+
+                    active_providers~udict_delete?(256, cid);
+                }
+            }
+        } until ( ~ continue);
+
+        ;; incoming amount should cover termination messages fees
+        raw_reserve(fee::storage + debt_amount, 0);
+
+        int count = 0;
+        ;; add needed providers
+        continue = true;
+        do {
+            (int cid, slice new_provider, continue) = providers~udict::delete_get_min(256);
+            if (continue) {
+                count += 1;
+
+                (slice active_provider, int exists) = active_providers.udict_get?(256, cid);
+                if (~ exists) {
+                    int span = new_provider~load_uint(32);
+                    int rate_per_mb_day = new_provider~load_coins();
+                    slice addr = new_provider~load_msg_addr();
+                    new_provider.end_parse();
+
+                    throw_if(error::span_is_zero, span == 0);
+                    throw_if(error::rate_is_zero, rate_per_mb_day == 0);
+
+                    active_providers~udict_set_builder(256, cid, begin_cell()
+                            .store_uint(rand(file_size), 64) ;; proof byte
+                            .store_uint(0, 32) ;; last proof at (0 because we want to get proof when povider will download our bag)
+                            .store_uint(0, 32) ;; last correct proof at
+                            .store_coins(0)        ;; balance
+                            .store_ref(begin_cell()
+                                    .store_uint(span, 32)
+                                    .store_coins(rate_per_mb_day)
+                                    .store_slice(addr)
+                                    .end_cell()));
+                }
+            }
+        } until ( ~ continue);
+
+        ;; more than 512 providers makes dict pressure and higher fees,
+        ;; if you want so much providers, just deploy new contract from another address
+        throw_if(error::too_many_providers, count > 512);
+
+        begin_cell()
+                .store_uint(torrent_hash, 256)
+                .store_dict(active_providers)
+                .store_slice(client)
+                .store_uint(file_size, 64)
+                .store_uint(chunk_size, 32)
+                .store_coins(debt_amount)
+                .store_uint(merkle_hash, 256)
+                .store_uint(key_len, 8)
+                .end_cell().set_data();
+    }
+
+    if (op == op::withdraw_owner) {
+        var storage = get_data().begin_parse();
+        int torrent_hash = storage~load_uint(256);
+        storage~skip_bits(1);
+        slice client = storage~load_msg_addr();
+        storage~skip_bits(64);
+        int debt_amount = storage~load_coins();
+
+        throw_unless(error::unauthorized, equal_slice_bits(sender_address, client));
+
+        raw_reserve(fee::storage + debt_amount, 0);
+
+        var client_msg = begin_cell()
+                .store_uint(0x10, 6)
+                .store_slice(client)
+                .store_coins(0)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(op::storage_contract_terminated, 32)
+                .store_uint(cur_lt(), 64)
+                .store_uint(torrent_hash, 256)
+                .end_cell();
+
+        return send_raw_message(client_msg, 128);
+    }
+}
+
+() recv_external(int contract_balance, int _, cell _, slice in_msg_body) {
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    var storage = get_data().begin_parse();
+    int torrent_hash = storage~load_uint(256);
+    cell active_providers = storage~load_dict();
+    slice client = storage~load_msg_addr();
+    int file_size = storage~load_uint(64);
+    int chunk_size = storage~load_uint(32);
+    int debt_amount = storage~load_coins();
+    int merkle_hash = storage~load_uint(256);
+    int key_len = storage~load_uint(8);
+
+    int key = in_msg_body~load_uint(256);
+    slice signature = in_msg_body~load_bits(512);
+    cell payload = in_msg_body~load_ref();
+    throw_unless(error::unauthorized, check_signature(payload.cell_hash(), signature, key));
+
+    slice pl = payload.begin_parse();
+    int msg_torrent_hash = pl~load_uint(256);
+    throw_unless(error::unauthorized, msg_torrent_hash == torrent_hash);
+
+    (slice provider, int exists) = active_providers.udict_get?(256, key);
+    throw_unless(error::unauthorized, exists);
+
+    if (op == op::withdraw_provider) {
+        slice pfx = provider~load_bits(96);
+        int last_correct_proof_time = provider~load_uint(32);
+        int balance = provider~load_coins();
+        cell info_cell = provider.preload_ref();
+        slice info = info_cell.begin_parse();
+        info~skip_bits(32);
+        info~load_coins();
+        slice provider_addr = info~load_msg_addr();
+
+        int op_verify = pl~load_uint(8);
+        throw_unless(error::unauthorized, op_verify == 1);
+
+        int msg_last_correct_proof_time = pl~load_uint(32);
+        ;; we use last_correct_proof_time for replay protection
+        throw_unless(error::unauthorized, msg_last_correct_proof_time == last_correct_proof_time);
+
+        throw_if(error::not_enough_balance, balance < fee::receipt_value);
+
+        accept_message();
+
+        ;; reserve all except provider balance
+        raw_reserve(balance, 1);
+        debt_amount -= balance;
+
+        var msg = begin_cell()
+                .store_uint(0x10, 6)
+                .store_slice(provider_addr)
+                .store_coins(0)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(op::reward_withdrawal, 32)
+                .store_uint(query_id, 64)
+                .end_cell();
+        send_raw_message(msg, 128);
+
+        active_providers~udict_set_builder(256, key, begin_cell()
+                .store_slice(pfx)
+                .store_uint(last_correct_proof_time, 32)
+                .store_coins(0) ;; balance
+                .store_ref(info_cell));
+
+        begin_cell()
+                .store_uint(torrent_hash, 256)
+                .store_dict(active_providers)
+                .store_slice(client)
+                .store_uint(file_size, 64)
+                .store_uint(chunk_size, 32)
+                .store_coins(debt_amount)
+                .store_uint(merkle_hash, 256)
+                .store_uint(key_len, 8)
+                .end_cell().set_data();
+
+        return ();
+    }
+
+    if (op == op::proof_storage) {
+        int next_proof_byte = provider~load_uint(64);
+        int last_proof_time = provider~load_uint(32);
+        int last_correct_proof_time = provider~load_uint(32);
+        int balance = provider~load_coins();
+        cell info_cell = provider.preload_ref();
+        slice info = info_cell.begin_parse();
+        int span = info~load_uint(32);
+        int rate_per_mb_day = info~load_coins();
+
+        int op_verify = pl~load_uint(8);
+        throw_unless(error::unauthorized, op_verify == 2);
+
+        ;; parse payload and verify that it belongs to current bag,
+        int msg_proof_byte = pl~load_uint(64);
+        throw_unless(error::unauthorized, msg_proof_byte == next_proof_byte);
+        cell proof = pl.preload_ref();
+
+        throw_if(error::too_early_to_proof, now() < (last_proof_time + span));
+
+        int bounty = muldiv(file_size * rate_per_mb_day, span, 24 * 60 * 60 * 1024 * 1024);
+        throw_if(error::not_enough_balance_for_reward, (contract_balance - (fee::storage + debt_amount + bounty)) < 0);
+
+        accept_message();
+
+        last_proof_time = now();
+
+        ;; pay bounty only if proof is correct,
+        ;; if not, provider must wait next round to earn bounty
+        try {
+            check_proof(merkle_hash, next_proof_byte, file_size, chunk_size, key_len, proof);
+
+            last_correct_proof_time = last_proof_time;
+            debt_amount += bounty;
+            balance += bounty;
+        } catch (_, _) { }
+
+        active_providers~udict_set_builder(256, key, begin_cell()
+                .store_uint(rand(file_size), 64) ;; proof byte
+                .store_uint(last_proof_time, 32) ;; last proof at
+                .store_uint(last_correct_proof_time, 32) ;; last correct proof at
+                .store_coins(balance)        ;; balance
+                .store_ref(info_cell));
+
+        begin_cell()
+                .store_uint(torrent_hash, 256)
+                .store_dict(active_providers)
+                .store_slice(client)
+                .store_uint(file_size, 64)
+                .store_uint(chunk_size, 32)
+                .store_coins(debt_amount)
+                .store_uint(merkle_hash, 256)
+                .store_uint(key_len, 8)
+                .end_cell().set_data();
+
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+_ get_storage_info() method_id {
+    var storage = get_data().begin_parse();
+    int torrent_hash = storage~load_uint(256);
+    storage~skip_bits(1);
+    slice client = storage~load_msg_addr();
+    int file_size = storage~load_uint(64);
+    int chunk_size = storage~load_uint(32);
+    storage~load_coins();
+    int merkle_hash = storage~load_uint(256);
+
+    return (torrent_hash, file_size, chunk_size, client, merkle_hash);
+}
+
+_ get_provider_info(int key) method_id {
+    var storage = get_data().begin_parse();
+    int torrent_hash = storage~load_uint(256);
+    cell active_providers = storage~load_dict();
+    storage~load_msg_addr();
+    storage~skip_bits(96);
+    int debt_amount = storage~load_coins();
+
+    (slice provider, int exists) = active_providers.udict_get?(256, key);
+    throw_unless(error::not_found, exists);
+
+    int next_proof_byte = provider~load_uint(64);
+    int last_proof_time = provider~load_uint(32);
+    int last_correct_proof_time = provider~load_uint(32);
+    int balance = provider~load_coins();
+    cell info_cell = provider.preload_ref();
+    slice info = info_cell.begin_parse();
+    int span = info~load_uint(32);
+    int rate_per_mb_day = info~load_coins();
+    slice addr = info~load_msg_addr();
+
+    var available_balance = get_balance().pair_first() - (debt_amount + fee::storage);
+
+    return (balance, last_correct_proof_time, last_proof_time, next_proof_byte, span, rate_per_mb_day, addr, available_balance);
+}
+
+_ get_available_balance() method_id {
+    var storage = get_data().begin_parse();
+    storage~skip_bits(256 + 1);
+    storage~load_msg_addr();
+    storage~skip_bits(96);
+    int debt_amount = storage~load_coins();
+
+    var balance = get_balance().pair_first();
+    return balance - (debt_amount + fee::storage);
+}
+
+_ get_providers() method_id {
+    var storage = get_data().begin_parse();
+    int torrent_hash = storage~load_uint(256);
+    cell active_providers = storage~load_dict();
+    storage~load_msg_addr();
+    storage~skip_bits(96);
+    int debt_amount = storage~load_coins();
+
+    tuple providers = empty_tuple();
+    int continue = -1;
+    int cid = -1;
+    do {
+        (cid, slice active_provider, continue) = active_providers.udict_get_next?(256, cid);
+        if (continue) {
+            active_provider~skip_bits(64);
+            int last_proof_time = active_provider~load_uint(32);
+            int last_correct_proof_time = active_provider~load_uint(32);
+            int balance = active_provider~load_coins();
+            cell ref = active_provider~load_ref();
+            slice info = ref.begin_parse();
+
+            int span = info~load_uint(32);
+            int rate_per_mb = info~load_coins();
+            slice addr = info~load_msg_addr();
+
+            providers~tpush([cid, addr, rate_per_mb, span, balance, last_correct_proof_time, last_proof_time]);
+        }
+    } until ( ~ continue);
+
+    return (debt_amount, providers);
+}
+
+_ verify_proof(int key, cell proof) method_id {
+    var storage = get_data().begin_parse();
+    storage~load_uint(256);
+    cell active_providers = storage~load_dict();
+    storage~load_msg_addr();
+    int file_size = storage~load_uint(64);
+    int chunk_size = storage~load_uint(32);
+    storage~load_coins();
+    int merkle_hash = storage~load_uint(256);
+    int key_len = storage~load_uint(8);
+
+    (slice provider, int exists) = active_providers.udict_get?(256, key);
+    throw_unless(error::not_found, exists);
+
+    int next_proof_byte = provider~load_uint(64);
+
+    check_proof(merkle_hash, next_proof_byte, file_size, chunk_size, key_len, proof);
+
+    return true;
+}
