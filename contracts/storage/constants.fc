@@ -1,9 +1,8 @@
-const op::modify_providers = 0xe4748df2;
-const op::withdraw_owner = 0x19f937ea;
+const op::modify_providers = 0x3dc680ae;
+const op::withdraw_owner = 0x61fff683;
 const op::reward_withdrawal = 0xa91baf56;
+const op::proof_storage = 0x48f548ce;
 const op::storage_contract_terminated = 0xb6236d63;
-const op::withdraw_provider = 0x46ed2e94;
-const op::proof_storage = 0x419d5d4d;
 
 const error::unauthorized = 401;
 const error::not_allowed = 403;
@@ -13,5 +12,4 @@ const error::too_many_providers = 406;
 const error::span_is_zero = 407;
 const error::rate_is_zero = 408;
 
-const error::too_early_to_proof = 430;
-const error::not_enough_balance_for_reward = 431;
+const error::unsupported_workchain = 111;
