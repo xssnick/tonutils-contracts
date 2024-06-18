@@ -29,7 +29,7 @@
                   // 1 + 132 + 132 + 256 + 256 + 128 + 32 + 32 + 1 = 970
 -}
 
-(cell, slice) udict_replace_get(cell dict, int key_len, int index, slice value) asm(value index dict key_len) "DICTUREPLACEGET";
+(cell, slice, int) udict_replace_get?(cell dict, int key_len, int index, slice value) asm(value index dict key_len) "DICTUREPLACEGET" "NULLSWAPIFNOT";
 (slice, int) begin_parse_special(cell c) asm "x{D739} s,";
 (slice -> int) cast_to_S2I(cont c) asm "NOP";
 ;; (slice, int) load_coins(slice s) asm( -> 1 0) "LDVARUINT16";
@@ -502,7 +502,7 @@ int closure_config::conditional_close_duration() inline {
 ;; `B` has time to finish A's conditionals
 ;;  settle_conditionals#_
 ;;                        from_A:Bool signature:bits512 tag:uint32 {tag = 0x436c436e} channel_id:uint128
-;;                        conditionals_to_settle:(HashmapE 32 Cell) conditionals_proof:Cell
+;;                        conditionals_to_settle:(HashmapE 32 Cell) conditionals_proof:^Cell updated_conditionals_proof:^Cell
 ;;                        = FinishConditionals;
 () settle_conditionals(slice msg) impure {
     load_storage(storage::up_to_quarantin);
@@ -516,7 +516,7 @@ int closure_config::conditional_close_duration() inline {
     cell conditionals_proof = msg~load_ref();
     ;; We need it to get updated state hash, cause we cannot calculate specific level hash in contract
     ;; we will verify its proof and default hash equality with our calculated state, if match - we can update conditionals proof hash.
-    cell updated_state_proof = msg~load_ref();
+    cell updated_conditionals_proof = msg~load_ref();
 
     slice stored_states = quarantin.begin_parse();
     (int seqno_A, int sent_A, int conditionals_hash_A) =
@@ -538,7 +538,7 @@ int closure_config::conditional_close_duration() inline {
         (target_hash, target_sent) = (conditionals_hash_B, sent_B);
     }
 
-    (slice cs_updated_proof, int special) = conditionals_proof.begin_parse_special();
+    (slice cs_updated_proof, int special) = updated_conditionals_proof.begin_parse_special();
     throw_if(error::incorrect_updated_proof, ~ special);
     throw_if(error::incorrect_updated_proof, cs_updated_proof~load_uint(8) != 3);
     int target_updated_merkle = cs_updated_proof.preload_uint(256);
@@ -554,7 +554,9 @@ int closure_config::conditional_close_duration() inline {
     do {
         (int cid, slice input, continue) = conditionals_to_settle~udict::delete_get_min(32);
         if(continue) {
-            (target, slice condition) = target.udict_replace_get(32, cid, empty_slice());
+            slice empty = empty_slice();
+            (target, slice condition, int ok) = target.udict_replace_get?(32, cid, empty);
+            throw_unless(error::incorrect_conditionals_proof, ok);
             var executable_condition = cast_to_S2I(condition.bless());
             ;; NOTE! It seems dangerous to run unknown code and it really is!
             ;; However, runned code is signed by one party and executed by another
