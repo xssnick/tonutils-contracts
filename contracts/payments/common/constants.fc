@@ -1,0 +1,69 @@
+const int error::jetton_wallet_not_installed = 98;
+const int error::jetton_wallet_already_installed = 99;
+const int error::already_inited = 100;
+const int error::not_authorized = 101;
+const int error::not_enough_money_for_init = 102;
+const int error::wrong_tag = 104;
+const int error::outdated_state = 105;
+const int error::quarantin_already_active = 106;
+const int error::no_quarantined_state = 107;
+const int error::seqno_regress = 108;
+const int error::quarantine_already_challenged = 115;
+const int error::unauthorized_challenge = 109;
+const int error::quarantin_not_finished = 110;
+const int error::too_late_for_quarantin_challenge = 111;
+const int error::too_late_to_settle_conditionals = 112;
+const int error::too_early_to_close = 113;
+const int error::wrong_channel_id = 114;
+const int error::incorrect_conditionals_proof = 115;
+const int error::incorrect_updated_proof = 116;
+
+const int tag::init = 0x696e6974;
+const int tag::cooperative_close = 0x436c6f73;
+const int tag::cooperative_commit = 0x43436d74;
+const int tag::start_uncooperative_close = 0x556e436c;
+const int tag::challenge_state = 0x43686751;
+const int tag::settle_conditionals = 0x436c436e;
+const int tag::state = 0x43685374;
+
+const int storage::full = 7;
+const int storage::up_to_quarantin = 3;
+const int storage::up_to_closure_config = 1;
+const int storage::balances_and_keys = 0;
+
+
+const int op::deploy_channel = "deploy_channel = IntenalMsgBody"c;
+const int op::top_up_balance = "top_up_balance add_A:Coins add_B:Coins = InternalMsgBody"c;
+const int op::init_channel = "init_channel is_A:Bool signature:bits512 tag:# = tag 1768843636 channel_id:uint128 balance_A:Coins balance_B:Coins = InternalMsgBody"c;
+const int op::cooperative_close = "cooperative_close sig_A:^bits512 sig_B:^bits512 tag:# = tag 1131179891 channel_id:uint128 balance_A:Coins balance_B:Coins seqno_A:uint64 seqno_B:uint64 = InternalMsgBody"c;
+const int op::cooperative_commit = "cooperative_commit sig_A:^bits512 sig_B:^bits512 tag:# = tag 1128492404 channel_id:uint128 seqno_A:uint64 seqno_B:uint64 = InternalMsgBody"c;
+const int op::start_uncooperative_close = "start_uncooperative_close signed_by_A:Bool signature:bits512 tag:# = tag 1433289580 channel_id:uint128 sch_A:^SignedSemiChannel sch_B:^SignedSemiChannel = InternalMsgBody"c;
+const int op::challenge_quarantined_state = "challenge_quarantined_state challenged_by_A:Bool signature:bits512 tag:# = tag 1130915665 channel_id:uint128 sch_A:^SignedSemiChannel sch_B:^SignedSemiChannel = InternalMsgBody"c;
+const int op::settle_conditionals = "settle_conditionals from_A:Bool signature:bits512 tag:# = tag 1131168622 channel_id:uint128 conditionals_to_settle:HashmapE 32 Cell = InternalMsgBody"c;
+const int op::finish_uncooperative_close = "finish_uncooperative_close = InternalMsgBody"c;
+const int op::channel_closed = "channel_closed channel_id:uint128 = InternalMsgBody"c;
+
+
+const int op::provide_wallet_address = 0x2c76b973;
+const int op::excesses = 0xd53276db;
+const int op::take_wallet_address = 0xd1735400;
+const int op::transfer_notification = 0x7362d09c;
+const int op::jetton_transfer = 0xf8a7ea5;
+
+const int state::UNINITED = 0;
+const int state::OPEN = 1;
+const int state::CLOSURE_STARTED = 2;
+const int state::SETTLING_CONDITIONALS = 3;
+const int state::AWAITING_FINALIZATION = 4;
+
+
+const int TAG_SIZE = 32;
+const int CHANNEL_ID_SIZE = 128;
+const int SEQNO_SIZE = 64;
+const int HASH_SIZE = 256;
+const int SIGNATURE_SIZE = 512;
+
+const int ZERO_COINS_SIZE = 4;
+
+const int accept_jettons_fee = 35000000;
+const int send_jettons_fee = 70000000;

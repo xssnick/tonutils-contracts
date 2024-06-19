@@ -1,0 +1,36 @@
+#include "../common/base.fc";
+#include "part.fc";
+
+() recv_any(slice msg) impure {
+    ;; Note, operators of channels are always off-chain parties, not contracts
+    ;; thus no responses and query_ids
+    int op = msg~load_op();
+    if(op == op::top_up_balance) {
+        return top_up_balance(msg);
+    } elseif(op == op::init_channel) {
+        return init_channel(msg);
+    } elseif (op == op::cooperative_close){
+        return cooperative_close(msg);
+    } elseif (op == op::cooperative_commit){
+        return cooperative_commit(msg);
+    } elseif (op == op::start_uncooperative_close){
+        return start_uncooperative_close(msg);
+    } elseif (op == op::challenge_quarantined_state){
+        return challenge_quarantined_state(msg);
+    } elseif (op == op::settle_conditionals){
+        return settle_conditionals(msg);
+    } elseif (op == op::finish_uncooperative_close){
+        return finish_uncooperative_close();
+    }
+    throw(0xffff);
+}
+
+() recv_internal (slice in_msg) {
+    return recv_any(in_msg);
+}
+
+() recv_external (slice in_msg) {
+    ;; Note, only cooperative_close and cooperative_commit
+    ;; will be accepted
+    return recv_any(in_msg);
+}

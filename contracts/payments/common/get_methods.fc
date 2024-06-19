@@ -1,0 +1,47 @@
+#include "../../imports/stdlib.fc";
+#include "constants.fc";
+#include "globals.fc";
+#include "base.fc";
+
+
+int get_channel_state () method_id {
+    load_storage(storage::full);
+    ifnot( inited ) {
+        return state::UNINITED;
+    }
+    if(cell_null?(quarantin)) {
+        return state::OPEN;
+    }
+    slice stored_states = quarantin.begin_parse();
+    stored_states~skip_bits(64);
+    stored_states~load_coins();
+    stored_states~skip_bits(1 + 64);
+    stored_states~load_coins();
+    stored_states~skip_bits(1);
+    int quarantine_started = stored_states~load_uint(32);
+    if (quarantine_started + closure_config::quarantin_duration() > now()) {
+        return state::CLOSURE_STARTED;
+    }
+    if (quarantine_started +
+            closure_config::quarantin_duration() +
+            closure_config::conditional_close_duration() > now()) {
+        return state::SETTLING_CONDITIONALS;
+    }
+    return state::AWAITING_FINALIZATION;
+}
+
+_ get_channel_data () method_id {
+    load_storage(storage::full);
+    slice pcs = payment_config.begin_parse();
+    int excess_fee = pcs~load_coins();
+    (slice addr_A, slice addr_B) = (pcs~load_msg_addr(), pcs~load_msg_addr());
+
+    return (get_channel_state(),
+            [balance_A, balance_B],
+            [key_A, key_B],
+            channel_id,
+            closure_config,
+            [commited_seqno_A, commited_seqno_B],
+            quarantin,
+            [excess_fee, addr_A, addr_B]);
+}

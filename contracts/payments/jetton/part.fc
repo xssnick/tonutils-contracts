@@ -1,0 +1,277 @@
+#include "../../imports/stdlib.fc";
+#include "../common/extlib.fc";
+#include "../common/constants.fc";
+#include "../common/globals.fc";
+
+
+() send_excesses(slice dest) impure inline {
+  ifnot (equal_slice_bits(dest, addr_none)) {
+    builder message = begin_cell()
+                     .store_msg_flags_non_bounceable()
+                     .store_slice(dest)
+                     .store_zeroes(ZERO_COINS_SIZE + MSG_ONLY_BODY_SIZE)
+                     .store_op(op::excesses)
+                     .store_query_id(0);
+    send_raw_message(message.end_cell(), sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE | sendmode::IGNORE_ERRORS);
+  }
+}
+
+
+() send_jettons(slice dest, int amount, slice jetton_wallet) impure inline {
+  {-
+    transfer query_id:uint64 amount:(VarUInteger 16) destination:MsgAddress
+             response_destination:MsgAddress custom_payload:(Maybe ^Cell)
+             forward_ton_amount:(VarUInteger 16) forward_payload:(Either Cell ^Cell)
+             = InternalMsgBody; 32 + 64 + 124 + 267 + 267 + 1 + 5  + 1
+  -}
+  builder message = begin_cell()
+                   .store_msg_flags_bounceable()
+                   .store_slice(jetton_wallet)
+                   .store_uint(MSG_BODY_IN_REF, ZERO_COINS_SIZE + MSG_ONLY_BODY_SIZE)
+                   .store_ref(begin_cell()
+                             .store_op(op::jetton_transfer)
+                             .store_query_id(0)
+                             .store_varuint16(amount)
+                             .store_slice(dest)
+                             .store_slice(dest)
+                             .store_maybe_ref(null())
+                             .store_varuint16(1)
+                             .store_false()
+                             .end_cell());
+  send_raw_message(message.end_cell(), sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE | sendmode::BOUNCE_ON_ACTION_FAIL);
+}
+
+
+(slice, ()) ~load_jetton_info (slice s) impure inline {
+  slice jetton_slice = s~load_ref().begin_parse();
+  jetton_root = jetton_slice~load_msg_addr();
+  jetton_wallet = jetton_slice~load_msg_addr();
+  jetton_balance = jetton_slice~load_coins();
+  return (s, ());
+}
+
+
+builder store_jetton_info (builder b) impure inline {
+  cell jetton_cell = begin_cell().store_slice(jetton_root).store_slice(jetton_wallet).store_coins(jetton_balance).end_cell();
+  return b.store_ref(jetton_cell);
+}
+
+
+int jetton_wallet_installed? () impure inline {
+  return addr_none?(jetton_wallet);
+}
+
+
+() load_storage (int level) impure {
+    storage_parse_level = level;
+    slice cs = get_data().begin_parse();
+    inited = cs~load_int(1);
+    balance_A = cs~load_coins();
+    balance_B = cs~load_coins();
+    key_A = cs~load_uint(256);
+    key_B = cs~load_uint(256);
+    channel_id = cs~load_uint(128);
+    cs~load_jetton_info();
+    cs~load_closure_config();
+    if(level >= storage::up_to_quarantin) {
+        commited_seqno_A = cs~load_uint(32);
+        commited_seqno_B = cs~load_uint(32);
+        quarantin = cs~load_maybe_ref();
+    }
+    if(level >= storage::full) {
+        payment_config = cs~load_ref();
+    }
+    unparsed_storage = cs;
+}
+
+
+() save_storage () impure {
+    int level = storage_parse_level;
+    builder storage = begin_cell();
+    storage = storage.store_int(inited, 1)
+            .store_coins(balance_A)
+            .store_coins(balance_B)
+            .store_uint(key_A, 256)
+            .store_uint(key_B, 256)
+            .store_uint(channel_id, 128)
+            .store_jetton_info()
+            .store_closure_config();
+    if(level >= storage::up_to_quarantin) {
+        storage = storage.store_uint(commited_seqno_A, 32)
+                .store_uint(commited_seqno_B, 32)
+                .store_maybe_ref(quarantin);
+    }
+    if(level >= storage::full){
+        storage = storage.store_ref(payment_config);
+    } else {
+        storage = storage.store_slice(unparsed_storage);
+    }
+    set_data(storage.end_cell());
+}
+
+
+() deploy_channel() impure inline_ref {
+    load_storage(storage::balances_and_keys);
+    throw_if(error::jetton_wallet_already_installed, jetton_wallet_installed?());
+    {- TEP-89
+      provide_wallet_address#2c76b973 query_id:uint64 owner_address:MsgAddress
+                                      include_address:Bool
+                                      = InternalMsgBody;
+    -}
+    builder message = begin_cell()
+                    ;; see "Message X" description in crypto/block/block.tlb
+                    ;; or https://ton.org/docs/#/smart-contracts/messages?id=sending-messages
+                    .store_uint(0x10, 6)                          ;; 0x10 = 0b010000 = {0, 1, 0 , 0, 00}
+                    ;; First 0 means int_msg_info$0 tag
+                    ;; 1 0 0 are flags (ihr_disabled, bounce, bounced)
+                    ;; 00 is a source address addr_none$00 tag,
+                    ;; correct value added automatically
+                    .store_slice(jetton_root)                ;; destination address
+                    .store_grams(0)
+                    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)   ;; 1 zero bit means there is no other:ExtraCurrencyCollection
+                    ;; 4 + 4 zero bits for empty ihr_fee:Grams and fwd_fee:Grams,
+                    ;; correct values added automatically
+                    ;; 64 + 32 zero bits for created_lt:uint64 and created_at:uint32,
+                    ;; correct values added automatically, see "CommonMsgInfo" description
+                    ;; 1 zero bit means there is no StateInit structure
+                    ;; 1 zero bit means the message body is represented
+                    ;; in this cell, not in reference
+                    ;; The following bits are the message body
+                   .store_uint(op::provide_wallet_address, 32)
+                   .store_uint(0, 64)
+                   .store_slice(my_address())
+                   .store_int(-1, 1);
+    send_raw_message(message.end_cell(), sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE | sendmode::IGNORE_ERRORS);
+    return ();
+}
+
+
+() install_jetton_wallet(slice payload) impure inline_ref {
+    {- TEP-89
+      take_wallet_address#d1735400 query_id:uint64 wallet_address:MsgAddress
+                                   owner_address:(Maybe ^MsgAddress)
+                                   = InternalMsgBody;
+    -}
+    payload~skip_bits(64);
+
+    throw_if(error::jetton_wallet_already_installed, jetton_wallet_installed?());
+    throw_unless(error::not_authorized, equal_slice_bits(jetton_root, sender));
+
+    slice wallet_address = payload~load_msg_addr();
+    jetton_wallet = wallet_address;
+
+    save_storage();
+    return ();
+}
+
+
+;; init_channel is_A:Bool signature:bits512 tag:# {tag = 0x696e6974} channel_id:uint128 balance_A:Coins balance_B:Coins = InternalMsgBody;
+() init_channel(slice msg) impure inline_ref {
+    load_storage(storage::full);
+    throw_unless(error::already_inited, ~ inited);
+    int is_A = msg~load_int(1);
+    slice signature = msg~load_bits(512);
+    throw_unless(error::not_authorized,
+            check_signature(slice_hash(msg), signature, is_A ? key_A : key_B));
+    throw_unless(error::wrong_tag, msg~load_uint(32) == tag::init);
+    throw_unless(error::wrong_channel_id, channel_id == msg~load_uint(128));
+    int set_balance_A = msg~load_coins();
+    int set_balance_B = msg~load_coins();
+    throw_unless(error::not_enough_money_for_init, (set_balance_A >= balance_A) &
+            (set_balance_B >= balance_B));
+    balance_A = set_balance_A;
+    balance_B = set_balance_B;
+    slice pcs = payment_config.begin_parse();
+    int excess_fee = pcs~load_coins();
+    throw_unless(error::not_enough_money_for_init, excess_fee < (get_balance().pair_first()));
+    throw_unless(error::not_enough_money_for_init, (balance_A + balance_B + excess_fee) < jetton_balance);
+    inited = true;
+    return save_storage();
+}
+
+
+() accept_jettons(slice payload) impure inline_ref {
+    load_storage(storage::balances_and_keys);
+    {- TEP-74
+      transfer_notification#7362d09c query_id:uint64 amount:(VarUInteger 16)
+                                     sender:MsgAddress forward_payload:(Either Cell ^Cell)
+                                     = InternalMsgBody;
+    -}
+    payload~skip_bits(64);
+    int jetton_amount = payload~load_coins();
+
+    slice jetton_sender = payload~load_msg_addr();
+    int either_forward_payload = payload~load_bool();
+    slice forward_payload = either_forward_payload ? payload~load_ref().begin_parse() : payload;
+
+    ifnot ((forward_payload.slice_bits() == (32)) &
+        (msg_value >= accept_jettons_fee) & ;; TODO: дописать проверку газа
+        (equal_slice_bits(jetton_wallet, sender))) {
+        send_jettons(jetton_sender, jetton_amount, sender);
+        return ();
+    }
+
+    int inner_op = forward_payload~load_op();
+
+    if ((inner_op == op::top_up_balance) & (~ inited)) {
+        jetton_balance += jetton_amount;
+        int add_A = forward_payload~load_coins();
+        int add_B = forward_payload~load_coins();
+        balance_A += add_A;
+        balance_B += add_B;
+        ;; depositor pay gas fees for himself
+        throw_unless(error::not_enough_money_for_init, (balance_A + balance_B) <= jetton_balance);
+
+        send_excesses(jetton_sender);
+        return save_storage();
+    }
+    send_jettons(jetton_sender, jetton_amount, sender);
+    return ();
+}
+
+
+() send_payout(slice s_addr, int amount, int channel_id) impure {
+    {-
+        transfer query_id:uint64 amount:(VarUInteger 16) destination:MsgAddress
+                 response_destination:MsgAddress custom_payload:(Maybe ^Cell)
+                 forward_ton_amount:(VarUInteger 16) forward_payload:(Either Cell ^Cell)
+                 = InternalMsgBody; 32 + 64 + 124 + 267 + 267 + 1 + 5  + 1
+    -}
+    builder message = begin_cell()
+                   .store_msg_flags_bounceable()
+                   .store_slice(jetton_wallet)
+                   .store_coins(send_jettons_fee)
+                   .store_uint(MSG_BODY_IN_REF,MSG_ONLY_BODY_SIZE)
+                   .store_ref(begin_cell()
+                             .store_op(op::jetton_transfer)
+                             .store_query_id(0)
+                             .store_varuint16(amount)
+                             .store_slice(s_addr)
+                             .store_slice(s_addr)
+                             .store_maybe_ref(null())
+                             .store_varuint16(1)
+                             .store_false()
+                             .store_uint(op::channel_closed, 32)
+                             .store_uint(channel_id, 128)
+                             .end_cell());
+  send_raw_message(message.end_cell(), sendmode::PAY_FEES_SEPARATELY | sendmode::BOUNCE_ON_ACTION_FAIL);
+
+}
+
+
+() close_channel() impure {
+    slice pcs = payment_config.begin_parse();
+    ;; int excess_fee = pcs~load_coins();
+    (slice addr_A, slice addr_B) = (pcs~load_msg_addr(), pcs~load_msg_addr());
+
+    send_payout(addr_B, balance_B, channel_id);
+    send_payout(addr_A, balance_A, channel_id);
+
+    ;; while channel contract will be emptied it will survive for some time
+    ;; by clearing storage we allow immediately reopen channel with the same configs
+    inited = false;
+    balance_A = 0;
+    balance_B = 0;
+    quarantin = null();
+    save_storage();
+}

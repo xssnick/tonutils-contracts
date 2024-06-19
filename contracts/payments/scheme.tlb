@@ -1,0 +1,74 @@
+// abstract //
+_ = Coins;
+_ = MsgAddress;
+_ {X:Type} {n:#} = HashmapE n X;
+_ = Bool;
+_ {X:Type} = Maybe X;
+_ {X:Type} {Y:Type} = Either X Y;
+//////////////
+
+
+// Common //
+
+cp#_ amount:Coins condition:Cell = ConditionalPayment;
+sc_body#_ seqno:uint64 sent:Coins conditionals_hash:uint256     // :(HashmapE 32 ConditionalPayment) WTF?
+          = SemiChannelBody; // 64+132+256 = 452
+semichannel_state#43685374 channel_id:uint128 data:SemiChannelBody counterparty_data:(Maybe ^SemiChannelBody)
+                      = SemiChannel; // 32 + 128 + 452 + 1 = 613
+signed_schs#_ signature:bits512 state:^SemiChannel = SignedSemiChannel; // 512 = 512
+quarantined_state#_ state_A:^SemiChannelBody state_B:^SemiChannelBody
+                   quarantine_starts:uint32
+                   state_commited_by_A:Bool
+                   state_challenged:Bool
+                   = QuarantinedState; // 32 + 1 + 1 = 34
+conf#_ quarantin_duration:uint32
+       misbehavior_fine:Coins
+       conditional_close_duration:uint32 = ClosingConfig; // 32 + 132 + 32 = 196
+payment_conf#_  excess_fee:Coins
+                dest_A:MsgAddress
+                dest_B:MsgAddress = PaymentConfig;
+
+
+
+init_channel is_A:Bool signature:bits512 tag:# {tag = 0x696e6974} channel_id:uint128 balance_A:Coins balance_B:Coins = InternalMsgBody;
+
+cooperative_close sig_A:^bits512 sig_B:^bits512 tag:# {tag = 0x436c6f73} channel_id:uint128 balance_A:Coins balance_B:Coins seqno_A:uint64 seqno_B:uint64 = InternalMsgBody;
+
+cooperative_commit sig_A:^bits512 sig_B:^bits512 tag:# {tag = 0x43436d74} channel_id:uint128 seqno_A:uint64 seqno_B:uint64 = InternalMsgBody;
+
+
+// TON channel //
+
+channel_state#_ inited:Bool
+                balance_A:Coins balance_B:Coins
+                key_A:uint256 key_B:uint256
+                channel_id:uint128
+                config:^ClosingConfig
+                commited_seqno_A:uint32 commited_seqno_B:uint32
+                quarantin:(Maybe ^QuarantinedState)
+                payments:^PaymentConfig = Storage;
+                // 1 + 132 + 132 + 256 + 256 + 128 + 32 + 32 + 1 = 970
+
+top_up_balance add_A:Coins add_B:Coins = InternalMsgBody;
+
+
+// Jetton channel //
+
+jetton_config#_ jetton_root:MsgAddress jetton_wallet:MsgAddress jetton_balance:Coins = JettonConfig;
+
+channel_state#_ inited:Bool
+                jetton_config:JettonConfig
+                balance_A:Coins balance_B:Coins
+                key_A:uint256 key_B:uint256
+                channel_id:uint128
+                config:^ClosingConfig
+                commited_seqno_A:uint32 commited_seqno_B:uint32
+                quarantin:(Maybe ^QuarantinedState)
+                payments:^PaymentConfig = Storage;
+                // 1 + 132 + 132 + 256 + 256 + 128 + 32 + 32 + 1 = 970
+
+deploy_channel = IntenalMsgBody;
+
+top_up_balance add_A:Coins add_B:Coins = Payload;
+
+transfer_notification#7362d09c query_id:uint64 amount:Coins sender:MsgAddress forward_payload:(Either Payload ^Payload) = InternalMsgBody;

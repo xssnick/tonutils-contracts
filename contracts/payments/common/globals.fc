@@ -1,0 +1,52 @@
+#include "extlib.fc";
+#include "../../imports/stdlib.fc";
+
+global int inited;
+global int balance_A;
+global int balance_B;
+global int key_A;
+global int key_B;
+global int channel_id;
+global tuple closure_config;
+global int commited_seqno_A;
+global int commited_seqno_B;
+global cell quarantin;
+global cell payment_config;
+global slice unparsed_storage;
+global int storage_parse_level;
+
+global slice sender;
+global int msg_value;
+
+
+global slice jetton_root;
+global slice jetton_wallet;
+global int jetton_balance;
+
+
+(slice, ()) ~load_closure_config(slice cs) {
+    slice conf = cs~load_ref().begin_parse();
+    closure_config = create_triple_tuple(conf~load_uint(32), conf~load_coins(), conf~load_uint(32));
+    return (cs, ());
+}
+
+int closure_config::quarantin_duration() inline {
+    return closure_config.first();
+}
+int closure_config::misbehavior_fine() inline {
+    return closure_config.second();
+}
+int closure_config::conditional_close_duration() inline {
+    return closure_config.third();
+}
+
+
+(builder) store_closure_config(builder b) {
+    return b.store_ref(begin_cell()
+            .store_uint(closure_config::quarantin_duration(), 32)
+            .store_coins(closure_config::misbehavior_fine())
+            .store_uint(closure_config::conditional_close_duration(), 32)
+            .end_cell()
+    );
+}
+
