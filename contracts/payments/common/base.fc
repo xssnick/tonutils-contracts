@@ -1,0 +1,366 @@
+#include "extlib.fc";
+#include "../../imports/stdlib.fc";
+#include "globals.fc";
+#include "constants.fc";
+
+() close_channel();
+() load_storage(int level);
+() save_storage();
+
+;; cooperative_close sig_A:^bits512 sig_B:^bits512 tag:# {tag = 0x436c6f73} channel_id:uint128 balance_A:Coins balance_B:Coins seqno_A:uint64 seqno_B:uint64 = InternalMsgBody;
+()  cooperative_close(slice msg) impure inline_ref {
+    load_storage(storage::full);
+    slice sig_A = msg~load_ref().begin_parse();
+    slice sig_B = msg~load_ref().begin_parse();
+    int hash = slice_hash(msg);
+    throw_unless(error::wrong_tag, msg~load_uint(TAG_SIZE) == tag::cooperative_close);
+    throw_unless(error::wrong_channel_id, channel_id == msg~load_uint(CHANNEL_ID_SIZE));
+    throw_unless(error::not_authorized, check_signature(hash, sig_A, key_A) &
+            check_signature(hash, sig_B, key_B) );
+    balance_A = msg~load_coins();
+    balance_B = msg~load_coins();
+    int new_seqno_A = msg~load_uint(SEQNO_SIZE);
+    int new_seqno_B = msg~load_uint(SEQNO_SIZE);
+    throw_unless(error::seqno_regress, (commited_seqno_A < new_seqno_A) &
+            (commited_seqno_B < new_seqno_B));
+    commited_seqno_A = new_seqno_A;
+    commited_seqno_B = new_seqno_B;
+    accept_message();
+    close_channel();
+}
+
+;; cooperative_commit sig_A:^bits512 sig_B:^bits512 tag:# {tag = 0x43436d74} channel_id:uint128 seqno_A:uint64 seqno_B:uint64 = InternalMsgBody;
+() cooperative_commit (slice msg) impure inline_ref {
+    load_storage(storage::up_to_quarantin);
+    slice sig_A = msg~load_ref().begin_parse();
+    slice sig_B = msg~load_ref().begin_parse();
+    int hash = slice_hash(msg);
+    throw_unless(error::wrong_tag, msg~load_uint(TAG_SIZE) == tag::cooperative_commit);
+    throw_unless(error::wrong_channel_id, channel_id == msg~load_uint(CHANNEL_ID_SIZE));
+    throw_unless(error::not_authorized, check_signature(hash, sig_A, key_A) &
+            check_signature(hash, sig_B, key_B) );
+
+    int new_seqno_A = msg~load_uint(SEQNO_SIZE);
+    int new_seqno_B = msg~load_uint(SEQNO_SIZE);
+    throw_unless(error::seqno_regress, (commited_seqno_A < new_seqno_A) &
+            (commited_seqno_B < new_seqno_B));
+    commited_seqno_A = new_seqno_A;
+    commited_seqno_B = new_seqno_B;
+
+    ifnot(cell_null?(quarantin)) {
+        slice stored_states = quarantin.begin_parse();
+        (int stored_seqno_A, int stored_sent_A) = (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins());
+        stored_states~skip_bits(1);
+        (int stored_seqno_B, int stored_sent_B) = (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins());
+        if((new_seqno_A > stored_seqno_A) | (new_seqno_B > stored_seqno_B)) {
+            ;; quarantinned state is older than newly commited one, drop it
+            quarantin = null();
+        }
+    }
+
+    accept_message();
+    save_storage();
+}
+
+
+;; sc_body#_ seqno:uint64 sent:Coins conditionals_hash:uint256
+;;        = SemiChannelBody; // 64+132+256 = 452
+;; semichannel_state#43685374 channel_id:uint128 data:SemiChannelBody counterparty_data:(Maybe ^SemiChannelBody)
+;;        = SemiChannel; // 32 + 128 + 452 + 1 = 613
+;; (cs, (seqno, sent, condtionals))
+
+(slice, (int, int, int)) parse_semichannel_data(cs) inline {
+    throw_unless(error::wrong_tag, cs~load_uint(TAG_SIZE) == tag::state);
+    throw_unless(error::wrong_channel_id, channel_id == cs~load_uint(CHANNEL_ID_SIZE));
+    (int, int, int) res = (cs~load_uint(SEQNO_SIZE), cs~load_coins(), cs~load_uint(HASH_SIZE));
+    return (cs, res);
+}
+
+(slice, (int, int, int)) parse_maybe_semichannel_body(cs) inline {
+    int maybe = cs~load_int(1);
+    ifnot(maybe) {
+        return (cs, (-1, -1, -1));
+    }
+    slice body = cs~load_ref().begin_parse();
+    return (cs, (body~load_uint(SEQNO_SIZE), body~load_coins(), body~load_uint(HASH_SIZE)));
+}
+
+;; At this stage we only make basic checks and save proposed state
+;; This state will be quarantined for some time (set in channel config)
+;; during which it can be challenged by counterparty.
+;; We check the following:
+;;   a) semistates are signed by corresponding party
+;;   b) counterparty_state are in each semistate is not worse than other semistate
+;;
+;;  signed_schs#_ signature:bits512 state:^SemiChannel = SignedSemiChannel;
+;; start_uncooperative_close signed_by_A:Bool signature:bits512 tag:# {tag = 0x556e436c} channel_id:uint128
+;;                     sch_A:^SignedSemiChannel
+;;                     sch_B:^SignedSemiChannel = InternalMsgBody;
+
+() start_uncooperative_close(slice msg) impure inline_ref {
+    load_storage(storage::up_to_quarantin);
+
+    throw_unless(error::quarantin_already_active, cell_null?(quarantin));
+    int signed_by_A = msg~load_bool();
+    slice signature = msg~load_bits(SIGNATURE_SIZE);
+    throw_unless(error::not_authorized, check_signature(slice_hash(msg), signature, signed_by_A ? key_A : key_B));
+    throw_unless(error::wrong_tag, msg~load_uint(TAG_SIZE) == tag::start_uncooperative_close);
+    throw_unless(error::wrong_channel_id, channel_id == msg~load_uint(CHANNEL_ID_SIZE));
+
+    slice semi_channel_A = msg~load_ref().begin_parse();
+    slice signature_A = semi_channel_A~load_bits(SIGNATURE_SIZE);
+    cell semi_channel_state_A = semi_channel_A.preload_ref();
+    throw_unless(error::not_authorized, check_signature(cell_hash(semi_channel_state_A), signature_A, key_A));
+    slice state_A = semi_channel_state_A.begin_parse();
+
+    slice semi_channel_B = msg~load_ref().begin_parse();
+    slice signature_B = semi_channel_B~load_bits(SIGNATURE_SIZE);
+    cell semi_channel_state_B = semi_channel_B.preload_ref();
+    throw_unless(error::not_authorized, check_signature(cell_hash(semi_channel_state_B), signature_B, key_B));
+    slice state_B = semi_channel_state_B.begin_parse();
+
+    ((int seqno_A, int sent_A, int conditionals_hash_A),
+            (int seqno_B_ref_A, int sent_B_ref_A, _)) = ( state_A~parse_semichannel_data(),
+            state_A~parse_maybe_semichannel_body());
+
+    ((int seqno_B, int sent_B, int conditionals_hash_B),
+            (int seqno_A_ref_B, int sent_A_ref_B, _)) = ( state_B~parse_semichannel_data(),
+            state_B~parse_maybe_semichannel_body());
+
+    throw_unless(error::outdated_state, (seqno_A >= commited_seqno_A) &
+            (seqno_B >= commited_seqno_B) &
+            (seqno_B >= seqno_B_ref_A) &
+            (seqno_A >= seqno_A_ref_B) &
+            (sent_B >= sent_B_ref_A) &
+            (sent_A >= sent_A_ref_B)
+    );
+
+    quarantin = begin_cell()
+            .store_uint(seqno_A, SEQNO_SIZE).store_coins(sent_A).store_uint(conditionals_hash_A, HASH_SIZE)
+            .store_uint(seqno_B, SEQNO_SIZE).store_coins(sent_B).store_uint(conditionals_hash_B, HASH_SIZE)
+            .store_uint(now(), 32)
+            .store_bool(signed_by_A)
+            .store_false()
+            .end_cell();
+
+    accept_message();
+    save_storage();
+}
+
+;; Logic is close to that in uncooperative_close:
+;; we make the same checks and then that new proposed state
+;; contains higher seqnos than quarantined state
+;; In that case we fine previous commiter and set new state
+;;  challenge_quarantined_state#_
+;;                        challenged_by_A:Bool signature:bits512 tag:uint32 {tag = 0x43686751} channel_id:uint128
+;;                        sch_A:^SignedSemiChannel
+;;                        sch_B:^SignedSemiChannel = ChallengeState;
+
+() challenge_quarantined_state(slice msg) impure inline_ref {
+    load_storage(storage::up_to_quarantin);
+    throw_unless(error::no_quarantined_state, ~ cell_null?(quarantin));
+
+    ;; Start with the same checks
+    int challenged_by_A = msg~load_bool();
+    slice signature = msg~load_bits(SIGNATURE_SIZE);
+    throw_unless(error::not_authorized, check_signature(slice_hash(msg), signature, challenged_by_A ? key_A : key_B));
+    throw_unless(error::wrong_tag, msg~load_uint(TAG_SIZE) == tag::challenge_state);
+    throw_unless(error::wrong_channel_id, channel_id == msg~load_uint(CHANNEL_ID_SIZE));
+
+    slice semi_channel_A = msg~load_ref().begin_parse();
+    slice signature_A = semi_channel_A~load_bits(SIGNATURE_SIZE);
+    cell semi_channel_state_A = semi_channel_A.preload_ref();
+    throw_unless(error::not_authorized, check_signature(cell_hash(semi_channel_state_A), signature_A, key_A));
+    slice state_A = semi_channel_state_A.begin_parse();
+
+    slice semi_channel_B = msg~load_ref().begin_parse();
+    slice signature_B = semi_channel_B~load_bits(SIGNATURE_SIZE);
+    cell semi_channel_state_B = semi_channel_B.preload_ref();
+    throw_unless(error::not_authorized, check_signature(cell_hash(semi_channel_state_B), signature_B, key_B));
+    slice state_B = semi_channel_state_B.begin_parse();
+
+    ((int seqno_A, int sent_A, int conditionals_hash_A),
+            (int seqno_B_ref_A, int sent_B_ref_A, _)) = ( state_A~parse_semichannel_data(),
+            state_A~parse_maybe_semichannel_body());
+
+    ((int seqno_B, int sent_B, int conditionals_hash_B),
+            (int seqno_A_ref_B, int sent_A_ref_B, _)) = ( state_B~parse_semichannel_data(),
+            state_B~parse_maybe_semichannel_body());
+
+    throw_unless(error::outdated_state, (seqno_B >= seqno_B_ref_A) &
+            (seqno_A >= seqno_A_ref_B) &
+            (seqno_B >= commited_seqno_B) &
+            (seqno_A >= commited_seqno_A) &
+            (sent_B >= sent_B_ref_A) &
+            (sent_A >= sent_A_ref_B)
+    );
+    if(seqno_B_ref_A > 0) {
+        throw_unless(error::outdated_state, (seqno_B_ref_A >= commited_seqno_B));
+    }
+    if(seqno_A_ref_B > 0) {
+        throw_unless(error::outdated_state, (seqno_A_ref_B >= commited_seqno_A));
+    }
+    slice stored_states = quarantin.begin_parse();
+    (int stored_seqno_A, int stored_sent_A) = (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins());
+    int stored_conditionals_hash_A = stored_states~load_uint(HASH_SIZE);
+
+    (int stored_seqno_B, int stored_sent_B) = (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins());
+    int stored_conditionals_hash_B = stored_states~load_uint(HASH_SIZE);
+
+    int quarantine_started = stored_states~load_uint(32);
+    throw_unless(error::too_late_for_quarantin_challenge,
+            quarantine_started + closure_config::quarantin_duration() > now());
+
+    int prev_signed_by_A = stored_states~load_bool();
+    int quarantine_challenged = stored_states~load_bool();
+    throw_unless(error::quarantine_already_challenged, ~ quarantine_challenged);
+
+    ;; misbehvaior is when party which committed outdated state
+    ;; or regenerate latest state with lower sent
+    int misbehavior_detected = false;
+    if(prev_signed_by_A) {
+        misbehavior_detected = (seqno_A > stored_seqno_A) | (sent_A > stored_sent_A);
+        stored_seqno_A = seqno_A;
+        stored_sent_A = sent_A;
+        stored_conditionals_hash_A = conditionals_hash_A;
+    } else {
+        misbehavior_detected = (seqno_B > stored_seqno_B) | (sent_B > stored_sent_B);
+        stored_seqno_B = seqno_B;
+        stored_sent_B = sent_B;
+        stored_conditionals_hash_B = conditionals_hash_B;
+    }
+    ;; only counterparty can report misbehavior
+    throw_unless(error::unauthorized_challenge,  ~ (prev_signed_by_A == challenged_by_A));
+
+    if(misbehavior_detected) {
+        ;; add fine to sent
+        if(prev_signed_by_A) {
+            stored_sent_A += closure_config::misbehavior_fine();
+        } else {
+            stored_sent_B += closure_config::misbehavior_fine();
+        }
+    }
+
+    quarantin = begin_cell()
+            .store_uint(stored_seqno_A, SEQNO_SIZE).store_coins(stored_sent_A).store_uint(stored_conditionals_hash_A, HASH_SIZE)
+            .store_uint(stored_seqno_B, SEQNO_SIZE).store_coins(stored_sent_B).store_uint(stored_conditionals_hash_B, HASH_SIZE)
+            .store_uint(quarantine_started, 32)
+            .store_bool(challenged_by_A)
+            .store_true()
+            .end_cell();
+    save_storage();
+}
+;; After state got out of quarantine we give some time to finish conditionals
+;; `A` has time to finish B's conditionals
+;; `B` has time to finish A's conditionals
+;;  settle_conditionals#_
+;;                        from_A:Bool signature:bits512 tag:uint32 {tag = 0x436c436e} channel_id:uint128
+;;                        conditionals_to_settle:(HashmapE 32 Cell) conditionals_proof:Cell
+;;                        = FinishConditionals;
+() settle_conditionals(slice msg) impure inline_ref {
+    load_storage(storage::up_to_quarantin);
+    throw_unless(error::no_quarantined_state, ~ cell_null?(quarantin));
+    int from_A = msg~load_bool();
+    slice signature = msg~load_bits(SIGNATURE_SIZE);
+    throw_unless(error::not_authorized, check_signature(slice_hash(msg), signature, from_A ? key_A : key_B));
+    throw_unless(error::wrong_tag, msg~load_uint(TAG_SIZE) == tag::settle_conditionals);
+    throw_unless(error::wrong_channel_id, channel_id == msg~load_uint(CHANNEL_ID_SIZE));
+    cell conditionals_to_settle = msg~load_dict();
+    cell conditionals_proof = msg~load_ref();
+    ;; We need it to get updated state hash, cause we cannot calculate specific level hash in contract
+    ;; we will verify its proof and default hash equality with our calculated state, if match - we can update conditionals proof hash.
+    cell updated_state_proof = msg~load_ref();
+
+    slice stored_states = quarantin.begin_parse();
+    (int seqno_A, int sent_A, int conditionals_hash_A) =
+            (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins(), stored_states~load_uint(HASH_SIZE));
+
+    (int seqno_B, int sent_B, int conditionals_hash_B) =
+            (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins(), stored_states~load_uint(HASH_SIZE));
+
+    int quarantine_started = stored_states~load_uint(32);
+    int quarantine_finished = quarantine_started + closure_config::quarantin_duration();
+    throw_unless(error::quarantin_not_finished, quarantine_finished < now());
+    throw_unless(error::too_late_to_settle_conditionals,
+            quarantine_finished + closure_config::conditional_close_duration() > now());
+
+    int state_commited_by_A = stored_states~load_int(1);
+    int challenged = stored_states~load_int(1);
+    (int target_hash, int target_sent) = (conditionals_hash_A, sent_A);
+    if(from_A) {
+        (target_hash, target_sent) = (conditionals_hash_B, sent_B);
+    }
+
+    (slice cs_updated_proof, int special) = conditionals_proof.begin_parse_special();
+    throw_if(error::incorrect_updated_proof, ~ special);
+    throw_if(error::incorrect_updated_proof, cs_updated_proof~load_uint(8) != 3);
+    int target_updated_merkle = cs_updated_proof.preload_uint(256);
+    int target_updated_hash = cell_hash(cs_updated_proof.preload_ref());
+
+    (slice cs_proof, int special) = conditionals_proof.begin_parse_special();
+    throw_if(error::incorrect_conditionals_proof, ~ special);
+    throw_if(error::incorrect_conditionals_proof, cs_proof~load_uint(8) != 3);
+    throw_if(error::incorrect_conditionals_proof, cs_proof.preload_uint(256) != target_hash);
+    cell target = cs_proof.preload_ref();
+
+    int continue = true;
+    do {
+        (int cid, slice input, continue) = conditionals_to_settle~udict_delete_get_min?(32);
+        if(continue) {
+            (target, slice condition, _) = target.udict_replace_get?(32, cid, EMPTY_SLICE);
+            var executable_condition = cast_slice_to_int(condition.bless());
+            ;; NOTE! It seems dangerous to run unknown code and it really is!
+            ;; However, runned code is signed by one party and executed by another
+            ;; That way both party authorized it.
+            ;; Obviously, B should not sign incorrect code which (for instance) sends all money to A
+            ;; The same way A should not run incorrect code which sends all money to B.
+            target_sent += executable_condition(input);
+        }
+    } until ( ~ continue);
+
+    throw_if(error::incorrect_updated_proof, target_updated_hash != cell_hash(target));
+    if(from_A) {
+        (conditionals_hash_B, sent_B) = (target_updated_merkle, target_sent);
+    } else {
+        (conditionals_hash_A, sent_A) = (target_updated_merkle, target_sent);
+    }
+
+    quarantin = begin_cell()
+            .store_uint(seqno_A, SEQNO_SIZE).store_coins(sent_A).store_uint(conditionals_hash_A, HASH_SIZE)
+            .store_uint(seqno_B, SEQNO_SIZE).store_coins(sent_B).store_uint(conditionals_hash_B, HASH_SIZE)
+            .store_uint(quarantine_started, 32)
+            .store_bool(state_commited_by_A)
+            .store_bool(challenged)
+            .end_cell();
+    save_storage();
+}
+
+
+() finish_uncooperative_close () impure inline_ref {
+    load_storage(storage::full);
+    throw_unless(error::no_quarantined_state, ~ cell_null?(quarantin));
+    slice stored_states = quarantin.begin_parse();
+    (int seqno_A, int sent_A, int conditionals_hash_A) =
+            (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins(), stored_states~load_uint(HASH_SIZE));
+    (int seqno_B, int sent_B, int conditionals_hash_B) =
+            (stored_states~load_uint(SEQNO_SIZE), stored_states~load_coins(), stored_states~load_uint(HASH_SIZE));
+    int quarantine_started = stored_states~load_uint(32);
+    throw_unless(error::too_early_to_close,
+            quarantine_started +
+                    closure_config::quarantin_duration() +
+                    closure_config::conditional_close_duration() < now());
+    accept_message();
+    balance_A = balance_A + sent_B - sent_A;
+    balance_B = balance_B + sent_A - sent_B;
+    if(balance_B < 0) {
+        balance_A += balance_B;
+        balance_B = 0;
+    }
+    if(balance_A < 0) {
+        balance_B += balance_A;
+        balance_B = 0;
+    }
+    commited_seqno_A = seqno_A + 1;
+    commited_seqno_B = seqno_B + 1;
+    close_channel();
+}

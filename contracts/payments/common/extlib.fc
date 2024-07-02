@@ -1,0 +1,6 @@
+;; (cell, slice, int) udict_replace_get?(cell dict, int key_len, int index, slice value) asm(value index dict key_len) "DICTUREPLACEGET" "NULLSWAPIFNOT";
+(slice, int) begin_parse_special(cell c) asm "XCTOS";
+(slice -> int) cast_slice_to_int(cont c) asm "NOP";
+forall X, Y, Z -> tuple create_triple_tuple(X x, Y y, Z z) asm "TRIPLE";
+
+const slice EMPTY_SLICE = ""s;

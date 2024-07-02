@@ -27,7 +27,7 @@ slice preload_ref_n_slice(slice s, int n) asm "PLDREFVAR CTOS";
     (slice cs, int special) = file_dict_proof.begin_parse_special();
     throw_if(13, ~ special);
     throw_if(14, cs~load_uint(8) != 3);
-    throw_if(151, cs.preload_uint(256) != merkle_hash);
+    throw_if(15, cs.preload_uint(256) != merkle_hash);
 
     cs = cs~load_ref_slice();
     int piece = byte_to_proof / chunk_size;
