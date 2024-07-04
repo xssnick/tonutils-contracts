@@ -3,9 +3,9 @@
 #include "globals.fc";
 #include "constants.fc";
 
-() close_channel();
-() load_storage(int level);
-() save_storage();
+;; () close_channel();
+;; () load_storage(int level);
+;; () save_storage();
 
 ;; cooperative_close sig_A:^bits512 sig_B:^bits512 tag:# {tag = 0x436c6f73} channel_id:uint128 balance_A:Coins balance_B:Coins seqno_A:uint64 seqno_B:uint64 = InternalMsgBody;
 ()  cooperative_close(slice msg) impure inline_ref {
