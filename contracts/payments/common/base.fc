@@ -269,7 +269,7 @@
     cell conditionals_proof = msg~load_ref();
     ;; We need it to get updated state hash, cause we cannot calculate specific level hash in contract
     ;; we will verify its proof and default hash equality with our calculated state, if match - we can update conditionals proof hash.
-    cell updated_state_proof = msg~load_ref();
+    cell updated_conditionals_proof = msg~load_ref();
 
     slice stored_states = quarantin.begin_parse();
     (int seqno_A, int sent_A, int conditionals_hash_A) =
@@ -291,7 +291,7 @@
         (target_hash, target_sent) = (conditionals_hash_B, sent_B);
     }
 
-    (slice cs_updated_proof, int special) = conditionals_proof.begin_parse_special();
+    (slice cs_updated_proof, int special) = updated_conditionals_proof.begin_parse_special();
     throw_if(error::incorrect_updated_proof, ~ special);
     throw_if(error::incorrect_updated_proof, cs_updated_proof~load_uint(8) != 3);
     int target_updated_merkle = cs_updated_proof.preload_uint(256);
@@ -307,7 +307,8 @@
     do {
         (int cid, slice input, continue) = conditionals_to_settle~udict_delete_get_min?(32);
         if(continue) {
-            (target, slice condition, _) = target.udict_replace_get?(32, cid, EMPTY_SLICE);
+            (target, slice condition, int ok) = target.udict_replace_get?(32, cid, EMPTY_SLICE);
+            throw_unless(error::incorrect_conditionals_proof, ok);
             var executable_condition = cast_slice_to_int(condition.bless());
             ;; NOTE! It seems dangerous to run unknown code and it really is!
             ;; However, runned code is signed by one party and executed by another
@@ -334,7 +335,6 @@
             .end_cell();
     save_storage();
 }
-
 
 () finish_uncooperative_close () impure inline_ref {
     load_storage(storage::full);
